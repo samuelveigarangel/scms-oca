@@ -1,4 +1,6 @@
+import gzip
 import io
+import json
 import tempfile
 from datetime import datetime
 from unittest.mock import MagicMock, patch
@@ -35,6 +37,13 @@ from .harvesters.article import (
     harvest_articles,
 )
 from .harvesters.dataset import harvest_data
+from .harvesters.openalex import (
+    fetch_part_document_ids,
+    harvest_openalex_works,
+    iter_part_files,
+    parse_updated_date_from_url,
+    s3_url_to_https,
+)
 from .harvesters.preprint import NODES, harvest_preprint
 from .bronze_transform import (
     _build_reindex_body,
@@ -56,6 +65,8 @@ from .models import (
     HarvestErrorLogPreprint,
     HarvestErrorLogSciELOData,
     HarvestModelChoice,
+    HarvestErrorLogOpenAlex,
+    OpenAlexHarvestRequest,
     TransformationScript,
 )
 from .parse_info_oai_pmh import (
@@ -1268,3 +1279,387 @@ class ArticleBronzeTransformTests(TestCase):
 
         mock_index.assert_called()
         mock_transform_page.assert_not_called()
+
+
+def _gzip_jsonl(records):
+    buffer = io.BytesIO()
+    with gzip.GzipFile(fileobj=buffer, mode="wb") as gz_file:
+        for record in records:
+            gz_file.write((json.dumps(record) + "\n").encode("utf-8"))
+    return buffer.getvalue()
+
+
+class HarvestOpenAlexSnapshotTests(TestCase):
+    def setUp(self):
+        self.user = User.objects.create_user(username="openalex-user", password="test")
+        self.manifest_url = (
+            "https://openalex.s3.amazonaws.com/data/jsonl/works/manifest.json"
+        )
+        self.old_part_s3 = (
+            "s3://openalex/data/jsonl/works/updated_date=2026-02-01/part_0000.gz"
+        )
+        self.part_s3 = (
+            "s3://openalex/data/jsonl/works/updated_date=2026-03-01/part_0000.gz"
+        )
+        self.part_https = (
+            "https://openalex.s3.amazonaws.com/data/jsonl/works/"
+            "updated_date=2026-03-01/part_0000.gz"
+        )
+        self.later_part_s3 = (
+            "s3://openalex/data/jsonl/works/updated_date=2026-03-02/part_0000.gz"
+        )
+        self.later_part_https = (
+            "https://openalex.s3.amazonaws.com/data/jsonl/works/"
+            "updated_date=2026-03-02/part_0000.gz"
+        )
+        self.manifest = {
+            "date": "2026-06-25",
+            "format": "jsonl",
+            "entity": "works",
+            "files": [
+                {
+                    "url": self.old_part_s3,
+                    "meta": {"record_count": 10, "content_length": 100},
+                },
+                {
+                    "url": self.part_s3,
+                    "meta": {"record_count": 2, "content_length": 200},
+                },
+                {
+                    "url": self.later_part_s3,
+                    "meta": {"record_count": 1, "content_length": 50},
+                },
+            ],
+        }
+
+    def test_s3_url_to_https(self):
+        self.assertEqual(s3_url_to_https(self.part_s3), self.part_https)
+
+    def test_parse_updated_date_from_url(self):
+        parsed = parse_updated_date_from_url(self.part_s3)
+        self.assertEqual(parsed.isoformat(), "2026-03-01")
+
+    def test_iter_part_files_keeps_partitions_from_updated_date(self):
+        parts = iter_part_files(self.manifest, "2026-03-01")
+        urls = [item["https_url"] for item in parts]
+        self.assertEqual(urls, [self.part_https, self.later_part_https])
+        self.assertTrue(all(item["s3_url"].startswith("s3://") for item in parts))
+
+    @patch("harvest.harvesters.openalex.fetch_data")
+    def test_fetch_part_document_ids_filters_publication_year(self, mock_fetch_data):
+        mock_fetch_data.return_value = _gzip_jsonl(
+            [
+                {
+                    "id": "https://openalex.org/W1",
+                    "publication_year": 2017,
+                    "is_xpac": True,
+                },
+                {
+                    "id": "https://openalex.org/W2",
+                    "publication_year": 2019,
+                    "is_xpac": True,
+                },
+                {
+                    "id": "https://openalex.org/W3",
+                    "publication_year": 2020,
+                },
+            ]
+        )
+
+        ids = fetch_part_document_ids(
+            self.part_https,
+            publication_year_from=2018,
+            is_xpac=True,
+        )
+
+        self.assertEqual(ids, ["https://openalex.org/W2"])
+        mock_fetch_data.assert_called_once()
+        self.assertFalse(mock_fetch_data.call_args.kwargs.get("json"))
+
+    @patch("harvest.harvesters.openalex.fetch_data")
+    def test_fetch_part_document_ids_skips_null_publication_year(self, mock_fetch_data):
+        mock_fetch_data.return_value = _gzip_jsonl(
+            [
+                {
+                    "id": "https://openalex.org/W1",
+                    "publication_year": None,
+                    "is_xpac": True,
+                },
+                {
+                    "id": "https://openalex.org/W2",
+                    "publication_year": 2020,
+                    "is_xpac": True,
+                },
+            ]
+        )
+
+        ids = fetch_part_document_ids(
+            self.part_https,
+            publication_year_from=2018,
+            is_xpac=True,
+        )
+
+        self.assertEqual(ids, ["https://openalex.org/W2"])
+
+    @patch("harvest.harvesters.openalex.fetch_data")
+    def test_fetch_part_document_ids_filters_is_xpac(self, mock_fetch_data):
+        mock_fetch_data.return_value = _gzip_jsonl(
+            [
+                {
+                    "id": "https://openalex.org/W1",
+                    "publication_year": 2020,
+                    "is_xpac": False,
+                },
+                {
+                    "id": "https://openalex.org/W2",
+                    "publication_year": 2020,
+                    "is_xpac": True,
+                },
+            ]
+        )
+
+        ids = fetch_part_document_ids(
+            self.part_https,
+            publication_year_from=2018,
+            is_xpac=True,
+        )
+
+        self.assertEqual(ids, ["https://openalex.org/W2"])
+
+    @override_settings(
+        OPENALEX_WORKS_MANIFEST_URL=(
+            "https://openalex.s3.amazonaws.com/data/jsonl/works/manifest.json"
+        )
+    )
+    @patch("harvest.harvesters.openalex.fetch_data")
+    def test_harvest_persists_filtered_ids_without_payload(self, mock_fetch_data):
+        gzip_payload = _gzip_jsonl(
+            [
+                {
+                    "id": "https://openalex.org/W1",
+                    "publication_year": 2017,
+                    "is_xpac": True,
+                    "title": "should not be stored",
+                },
+                {
+                    "id": "https://openalex.org/W2",
+                    "publication_year": 2019,
+                    "is_xpac": True,
+                    "title": "should not be stored either",
+                },
+            ]
+        )
+
+        def fake_fetch(url, headers=None, json=False, timeout=2, verify=True):
+            if json:
+                return self.manifest
+            return gzip_payload
+
+        mock_fetch_data.side_effect = fake_fetch
+
+        harvest_openalex_works(
+            user=self.user,
+            from_updated_date="2026-03-01",
+            publication_year_from=2018,
+            max_parts=1,
+        )
+
+        manifest_row = OpenAlexHarvestRequest.objects.get(request_kind="manifest")
+        self.assertEqual(manifest_row.harvest_status, "in_progress")
+        self.assertEqual(manifest_row.updated_date.isoformat(), "2026-06-25")
+        self.assertEqual(manifest_row.request_url, self.manifest_url)
+
+        part_row = OpenAlexHarvestRequest.objects.get(request_kind="part")
+        self.assertEqual(part_row.harvest_status, "success")
+        self.assertEqual(part_row.request_url, self.part_https)
+        self.assertEqual(part_row.document_ids, ["https://openalex.org/W2"])
+        self.assertEqual(part_row.result_count, 1)
+        self.assertEqual(part_row.manifest_record_count, 2)
+        self.assertEqual(part_row.updated_date.isoformat(), "2026-03-01")
+        self.assertNotIn("title", json.dumps(part_row.document_ids))
+        self.assertFalse(hasattr(part_row, "raw_data") and part_row.raw_data)
+
+    @override_settings(
+        OPENALEX_WORKS_MANIFEST_URL=(
+            "https://openalex.s3.amazonaws.com/data/jsonl/works/manifest.json"
+        )
+    )
+    @patch("harvest.harvesters.openalex.fetch_data")
+    def test_harvest_skips_parts_already_successful(self, mock_fetch_data):
+        OpenAlexHarvestRequest.objects.create(
+            creator=self.user,
+            request_url=self.part_https,
+            request_kind="part",
+            harvest_status="success",
+            requested_at=timezone.now(),
+        )
+
+        def fake_fetch(url, headers=None, json=False, timeout=2, verify=True):
+            if json:
+                return {
+                    "date": "2026-06-25",
+                    "files": [
+                        {
+                            "url": self.part_s3,
+                            "meta": {"record_count": 2},
+                        }
+                    ]
+                }
+            raise AssertionError("Part already harvested should not be fetched.")
+
+        mock_fetch_data.side_effect = fake_fetch
+
+        harvest_openalex_works(
+            user=self.user,
+            from_updated_date="2026-03-01",
+            publication_year_from=2018,
+        )
+
+        self.assertEqual(
+            OpenAlexHarvestRequest.objects.filter(request_kind="part").count(),
+            1,
+        )
+        mock_fetch_data.assert_called_once()
+
+    @override_settings(
+        OPENALEX_WORKS_MANIFEST_URL=(
+            "https://openalex.s3.amazonaws.com/data/jsonl/works/manifest.json"
+        )
+    )
+    @patch("harvest.harvesters.openalex.fetch_data")
+    def test_harvest_does_not_process_registered_manifest(self, mock_fetch_data):
+        OpenAlexHarvestRequest.objects.create(
+            creator=self.user,
+            request_url=self.manifest_url,
+            request_kind="manifest",
+            updated_date=datetime(2026, 6, 25).date(),
+            publication_year_from=2018,
+            harvest_status="success",
+            requested_at=timezone.now(),
+        )
+        mock_fetch_data.return_value = self.manifest
+
+        harvest_openalex_works(
+            user=self.user,
+            from_updated_date="2026-03-01",
+            publication_year_from=2018,
+        )
+
+        self.assertEqual(
+            OpenAlexHarvestRequest.objects.filter(request_kind="manifest").count(),
+            1,
+        )
+        self.assertFalse(
+            OpenAlexHarvestRequest.objects.filter(request_kind="part").exists()
+        )
+        mock_fetch_data.assert_called_once()
+
+    @override_settings(
+        OPENALEX_WORKS_MANIFEST_URL=(
+            "https://openalex.s3.amazonaws.com/data/jsonl/works/manifest.json"
+        )
+    )
+    @patch("harvest.harvesters.openalex.fetch_data")
+    def test_harvest_stops_on_part_failure(self, mock_fetch_data):
+        def fake_fetch(url, headers=None, json=False, timeout=2, verify=True):
+            if json:
+                return self.manifest
+            raise RuntimeError("S3 timeout")
+
+        mock_fetch_data.side_effect = fake_fetch
+
+        harvest_openalex_works(
+            user=self.user,
+            from_updated_date="2026-03-01",
+            publication_year_from=2018,
+        )
+
+        part_rows = OpenAlexHarvestRequest.objects.filter(request_kind="part")
+        self.assertEqual(part_rows.count(), 1)
+        failed = part_rows.get()
+        self.assertEqual(failed.harvest_status, "failed")
+        log = HarvestErrorLogOpenAlex.objects.get()
+        self.assertIn("S3 timeout", log.exception_message)
+        self.assertEqual(log.field_name, "part")
+        self.assertEqual(failed.request_url, self.part_https)
+        self.assertEqual(
+            OpenAlexHarvestRequest.objects.get(
+                request_kind="manifest"
+            ).harvest_status,
+            "failed",
+        )
+
+    @override_settings(
+        OPENALEX_WORKS_MANIFEST_URL=(
+            "https://openalex.s3.amazonaws.com/data/jsonl/works/manifest.json"
+        ),
+    )
+    @patch("harvest.harvesters.openalex.fetch_data")
+    def test_harvest_collects_unregistered_parts_since_initial_date(
+        self,
+        mock_fetch_data,
+    ):
+        OpenAlexHarvestRequest.objects.create(
+            creator=self.user,
+            request_url=self.later_part_https,
+            request_kind="part",
+            updated_date=datetime(2026, 3, 2).date(),
+            publication_year_from=2018,
+            harvest_status="success",
+            requested_at=timezone.now(),
+        )
+
+        def fake_fetch(url, headers=None, json=False, timeout=2, verify=True):
+            if json:
+                return self.manifest
+            return _gzip_jsonl(
+                [{"id": "https://openalex.org/W3", "publication_year": 2020, "is_xpac": True}]
+            )
+
+        mock_fetch_data.side_effect = fake_fetch
+
+        harvest_openalex_works(
+            user=self.user,
+            publication_year_from=2018,
+            from_updated_date="2026-03-01",
+        )
+
+        collected_urls = list(
+            OpenAlexHarvestRequest.objects.filter(
+                request_kind="part",
+                request_url=self.part_https,
+            ).values_list("request_url", flat=True)
+        )
+        self.assertEqual(collected_urls, [self.part_https])
+        self.assertEqual(
+            OpenAlexHarvestRequest.objects.filter(
+                request_url=self.later_part_https,
+            ).count(),
+            1,
+        )
+        self.assertEqual(
+            OpenAlexHarvestRequest.objects.get(
+                request_kind="manifest"
+            ).harvest_status,
+            "success",
+        )
+
+    @patch("harvest.tasks.harvest_openalex_works")
+    def test_task_delegates_manifest_scan_to_harvester(self, mock_harvest):
+        from harvest.tasks import harvest_openalex_works_task
+
+        harvest_openalex_works_task(
+            username=self.user.username,
+            publication_year_from=2018,
+            from_updated_date="2026-03-01",
+            is_xpac=True,
+        )
+
+        self.assertEqual(mock_harvest.call_args.kwargs["publication_year_from"], 2018)
+        self.assertEqual(
+            mock_harvest.call_args.kwargs["from_updated_date"],
+            "2026-03-01",
+        )
+        self.assertEqual(mock_harvest.call_args.kwargs["is_xpac"], True)
+        self.assertEqual(mock_harvest.call_args.kwargs["user"], self.user)
+
