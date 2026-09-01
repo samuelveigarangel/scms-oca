@@ -74,5 +74,5 @@ OPENALEX_WORKS_MANIFEST_URL = _env.str(
 )
 OPENALEX_PART_FETCH_TIMEOUT = _env.int(
     "OPENALEX_PART_FETCH_TIMEOUT",
-    default=300,
+    default=15,
 )
