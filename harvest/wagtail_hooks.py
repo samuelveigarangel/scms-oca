@@ -135,12 +135,13 @@ class OpenAlexHarvestRequestViewSet(SnippetViewSet):
     list_display = (
         "request_kind",
         "harvest_status",
+        "index_status",
         "updated_date",
         "result_count",
         "requested_at",
     )
     search_fields = ("request_url",)
-    list_filter = ("harvest_status", "request_kind", "updated_date")
+    list_filter = ("harvest_status", "index_status", "request_kind", "updated_date")
     ordering = ("-requested_at", "-created")
 
 
