@@ -16,35 +16,6 @@ from harvest.language_normalizer import (
     normalize_language_value,
 )
 
-from .exception_logs import ExceptionContext
-from .global_metrics.constants import GLOBAL_METRICS_REQUIRED_COLUMNS
-from .global_metrics.indexing import (
-    GlobalMetricsIndexingError,
-    index_prepared_rows,
-    iter_file_rows,
-)
-from .global_metrics.process import process_global_metrics_upload_file
-from .global_metrics.opensearch import (
-    build_global_metrics_update_by_query_body,
-    iter_harvest_metric_groups,
-    source_file_query,
-    update_silver_group_by_query,
-    wait_for_update_task,
-)
-from .global_metrics.parsing import global_metric_row_from_hit
-from .harvesters.article import (
-    fetch_article_identifiers_page,
-    harvest_articles,
-)
-from .harvesters.dataset import harvest_data
-from .harvesters.openalex import (
-    fetch_part_document_ids,
-    harvest_openalex_works,
-    iter_part_files,
-    parse_updated_date_from_url,
-    s3_url_to_https,
-)
-from .harvesters.preprint import NODES, harvest_preprint
 from .bronze_transform import (
     _build_reindex_body,
     _refresh_source_for_page,
@@ -53,6 +24,37 @@ from .bronze_transform import (
     transform_documents_page,
     transform_indexed_page,
 )
+from .exception_logs import ExceptionContext
+from .global_metrics.constants import GLOBAL_METRICS_REQUIRED_COLUMNS
+from .global_metrics.indexing import (
+    GlobalMetricsIndexingError,
+    index_prepared_rows,
+    iter_file_rows,
+)
+from .global_metrics.opensearch import (
+    build_global_metrics_update_by_query_body,
+    iter_harvest_metric_groups,
+    source_file_query,
+    update_silver_group_by_query,
+    wait_for_update_task,
+)
+from .global_metrics.parsing import global_metric_row_from_hit
+from .global_metrics.process import process_global_metrics_upload_file
+from .harvesters.article import (
+    fetch_article_identifiers_page,
+    harvest_articles,
+)
+from .harvesters.dataset import harvest_data
+from .harvesters.openalex import (
+    harvest_openalex_works,
+    index_openalex_batch,
+    iter_gzip_jsonl_works,
+    iter_part_files,
+    iter_part_works,
+    parse_updated_date_from_url,
+    s3_url_to_https,
+)
+from .harvesters.preprint import NODES, harvest_preprint
 from .indexing import get_index_name
 from .models import (
     GlobalMetricsUploadFile,
@@ -62,10 +64,10 @@ from .models import (
     HarvestedSciELOData,
     HarvestErrorLogArticle,
     HarvestErrorLogBook,
+    HarvestErrorLogOpenAlex,
     HarvestErrorLogPreprint,
     HarvestErrorLogSciELOData,
     HarvestModelChoice,
-    HarvestErrorLogOpenAlex,
     OpenAlexHarvestRequest,
     TransformationScript,
 )
@@ -1289,9 +1291,24 @@ def _gzip_jsonl(records):
     return buffer.getvalue()
 
 
+def _mock_fetch_payloads(mock_fetch_data, manifest, part_payload):
+    def fake_fetch(url, headers=None, json=False, timeout=2, verify=True):
+        if json:
+            return manifest
+        return part_payload
+
+    mock_fetch_data.side_effect = fake_fetch
+
+
 class HarvestOpenAlexSnapshotTests(TestCase):
     def setUp(self):
         self.user = User.objects.create_user(username="openalex-user", password="test")
+        client_patcher = patch("harvest.harvesters.openalex.OpenSearchClient")
+        self.addCleanup(client_patcher.stop)
+        self.mock_client_class = client_patcher.start()
+        self.open_search = self.mock_client_class.return_value
+        self.open_search.client.search.return_value = {"hits": {"hits": []}}
+        self.open_search.client.bulk.return_value = {"errors": False, "items": []}
         self.manifest_url = (
             "https://openalex.s3.amazonaws.com/data/jsonl/works/manifest.json"
         )
@@ -1345,18 +1362,73 @@ class HarvestOpenAlexSnapshotTests(TestCase):
         self.assertEqual(urls, [self.part_https, self.later_part_https])
         self.assertTrue(all(item["s3_url"].startswith("s3://") for item in parts))
 
-    @patch("harvest.harvesters.openalex.fetch_data")
-    def test_fetch_part_document_ids_filters_publication_year(self, mock_fetch_data):
-        mock_fetch_data.return_value = _gzip_jsonl(
+    def test_iter_gzip_jsonl_works_filters_publication_year(self):
+        payload = _gzip_jsonl(
             [
                 {
                     "id": "https://openalex.org/W1",
                     "publication_year": 2017,
-                    "is_xpac": True,
+                    "is_xpac": False,
                 },
                 {
                     "id": "https://openalex.org/W2",
                     "publication_year": 2019,
+                    "is_xpac": False,
+                },
+                {
+                    "id": "https://openalex.org/W3",
+                    "publication_year": 2020,
+                },
+            ]
+        )
+
+        ids = [
+            work["id"]
+            for work in iter_gzip_jsonl_works(
+                io.BytesIO(payload),
+                publication_year_from=2018,
+                is_xpac=False,
+            )
+        ]
+
+        self.assertEqual(ids, ["https://openalex.org/W2", "https://openalex.org/W3"])
+
+    def test_iter_gzip_jsonl_works_skips_null_publication_year(self):
+        payload = _gzip_jsonl(
+            [
+                {
+                    "id": "https://openalex.org/W1",
+                    "publication_year": None,
+                },
+                {
+                    "id": "https://openalex.org/W2",
+                    "publication_year": 2020,
+                },
+            ]
+        )
+
+        ids = [
+            work["id"]
+            for work in iter_gzip_jsonl_works(
+                io.BytesIO(payload),
+                publication_year_from=2018,
+                is_xpac=False,
+            )
+        ]
+
+        self.assertEqual(ids, ["https://openalex.org/W2"])
+
+    def test_iter_gzip_jsonl_works_keeps_missing_is_xpac_when_filter_is_false(self):
+        payload = _gzip_jsonl(
+            [
+                {
+                    "id": "https://openalex.org/W1",
+                    "publication_year": 2020,
+                    "is_xpac": False,
+                },
+                {
+                    "id": "https://openalex.org/W2",
+                    "publication_year": 2020,
                     "is_xpac": True,
                 },
                 {
@@ -1366,44 +1438,19 @@ class HarvestOpenAlexSnapshotTests(TestCase):
             ]
         )
 
-        ids = fetch_part_document_ids(
-            self.part_https,
-            publication_year_from=2018,
-            is_xpac=True,
-        )
+        ids = [
+            work["id"]
+            for work in iter_gzip_jsonl_works(
+                io.BytesIO(payload),
+                publication_year_from=2018,
+                is_xpac=False,
+            )
+        ]
 
-        self.assertEqual(ids, ["https://openalex.org/W2"])
-        mock_fetch_data.assert_called_once()
-        self.assertFalse(mock_fetch_data.call_args.kwargs.get("json"))
+        self.assertEqual(ids, ["https://openalex.org/W1", "https://openalex.org/W3"])
 
-    @patch("harvest.harvesters.openalex.fetch_data")
-    def test_fetch_part_document_ids_skips_null_publication_year(self, mock_fetch_data):
-        mock_fetch_data.return_value = _gzip_jsonl(
-            [
-                {
-                    "id": "https://openalex.org/W1",
-                    "publication_year": None,
-                    "is_xpac": True,
-                },
-                {
-                    "id": "https://openalex.org/W2",
-                    "publication_year": 2020,
-                    "is_xpac": True,
-                },
-            ]
-        )
-
-        ids = fetch_part_document_ids(
-            self.part_https,
-            publication_year_from=2018,
-            is_xpac=True,
-        )
-
-        self.assertEqual(ids, ["https://openalex.org/W2"])
-
-    @patch("harvest.harvesters.openalex.fetch_data")
-    def test_fetch_part_document_ids_filters_is_xpac(self, mock_fetch_data):
-        mock_fetch_data.return_value = _gzip_jsonl(
+    def test_iter_gzip_jsonl_works_filters_is_xpac_true(self):
+        payload = _gzip_jsonl(
             [
                 {
                     "id": "https://openalex.org/W1",
@@ -1418,13 +1465,37 @@ class HarvestOpenAlexSnapshotTests(TestCase):
             ]
         )
 
-        ids = fetch_part_document_ids(
-            self.part_https,
-            publication_year_from=2018,
-            is_xpac=True,
-        )
+        ids = [
+            work["id"]
+            for work in iter_gzip_jsonl_works(
+                io.BytesIO(payload),
+                publication_year_from=2018,
+                is_xpac=True,
+            )
+        ]
 
         self.assertEqual(ids, ["https://openalex.org/W2"])
+
+    @patch("harvest.harvesters.openalex.fetch_data")
+    def test_iter_part_works_fetches_gzip_payload(self, mock_fetch_data):
+        payload = _gzip_jsonl(
+            [{"id": "https://openalex.org/W2", "publication_year": 2020}]
+        )
+        mock_fetch_data.return_value = payload
+
+        ids = [
+            work["id"]
+            for work in iter_part_works(
+                self.part_https,
+                publication_year_from=2018,
+                is_xpac=False,
+            )
+        ]
+
+        self.assertEqual(ids, ["https://openalex.org/W2"])
+        mock_fetch_data.assert_called_once()
+        self.assertEqual(mock_fetch_data.call_args.args[0], self.part_https)
+        self.assertFalse(mock_fetch_data.call_args.kwargs["json"])
 
     @override_settings(
         OPENALEX_WORKS_MANIFEST_URL=(
@@ -1432,52 +1503,244 @@ class HarvestOpenAlexSnapshotTests(TestCase):
         )
     )
     @patch("harvest.harvesters.openalex.fetch_data")
-    def test_harvest_persists_filtered_ids_without_payload(self, mock_fetch_data):
+    def test_harvest_indexes_filtered_works_without_persisting_ids(
+        self,
+        mock_fetch_data,
+    ):
         gzip_payload = _gzip_jsonl(
             [
                 {
                     "id": "https://openalex.org/W1",
                     "publication_year": 2017,
-                    "is_xpac": True,
                     "title": "should not be stored",
                 },
                 {
                     "id": "https://openalex.org/W2",
                     "publication_year": 2019,
-                    "is_xpac": True,
                     "title": "should not be stored either",
+                    "authorships": [
+                        {
+                            "author": {"display_name": "Author"},
+                            "institutions": [
+                                {
+                                    "display_name": "Universidade",
+                                    "country_code": "BR",
+                                }
+                            ],
+                        }
+                    ],
                 },
             ]
         )
-
-        def fake_fetch(url, headers=None, json=False, timeout=2, verify=True):
-            if json:
-                return self.manifest
-            return gzip_payload
-
-        mock_fetch_data.side_effect = fake_fetch
+        _mock_fetch_payloads(
+            mock_fetch_data,
+            {
+                "date": "2026-06-25",
+                "files": [
+                    {
+                        "url": self.part_s3,
+                        "meta": {"record_count": 2},
+                    }
+                ],
+            },
+            gzip_payload,
+        )
 
         harvest_openalex_works(
             user=self.user,
             from_updated_date="2026-03-01",
             publication_year_from=2018,
-            max_parts=1,
         )
 
         manifest_row = OpenAlexHarvestRequest.objects.get(request_kind="manifest")
-        self.assertEqual(manifest_row.harvest_status, "in_progress")
+        self.assertEqual(manifest_row.harvest_status, "success")
         self.assertEqual(manifest_row.updated_date.isoformat(), "2026-06-25")
         self.assertEqual(manifest_row.request_url, self.manifest_url)
 
         part_row = OpenAlexHarvestRequest.objects.get(request_kind="part")
         self.assertEqual(part_row.harvest_status, "success")
+        self.assertEqual(part_row.index_status, "success")
         self.assertEqual(part_row.request_url, self.part_https)
-        self.assertEqual(part_row.document_ids, ["https://openalex.org/W2"])
+        self.assertEqual(part_row.document_ids, [])
         self.assertEqual(part_row.result_count, 1)
         self.assertEqual(part_row.manifest_record_count, 2)
         self.assertEqual(part_row.updated_date.isoformat(), "2026-03-01")
-        self.assertNotIn("title", json.dumps(part_row.document_ids))
         self.assertFalse(hasattr(part_row, "raw_data") and part_row.raw_data)
+        self.open_search.ensure_rollover_index.assert_called_once()
+        bulk_body = self.open_search.client.bulk.call_args.kwargs["body"]
+        self.assertEqual(
+            bulk_body[0]["index"]["_index"],
+            "silver_openalex_write",
+        )
+        self.assertEqual(
+            bulk_body[0]["index"]["_id"],
+            "https://openalex.org/W2",
+        )
+        self.assertEqual(
+            bulk_body[1]["oca_data"]["openalex"]["affiliations"]["world_regions"],
+            ["South America"],
+        )
+        self.open_search.rollover.assert_called_once()
+
+    def test_index_openalex_batch_indexes_by_openalex_id_on_write_alias(self):
+        openalex_id = "https://openalex.org/W2"
+
+        indexed = index_openalex_batch(
+            self.open_search,
+            [(openalex_id, {"ids": {"openalex": openalex_id}})],
+        )
+
+        bulk_body = self.open_search.client.bulk.call_args.kwargs["body"]
+        self.assertEqual(
+            bulk_body[0]["index"],
+            {
+                "_index": "silver_openalex_write",
+                "_id": openalex_id,
+            },
+        )
+        self.assertEqual(indexed, 1)
+        self.open_search.client.search.assert_not_called()
+
+    @patch("harvest.harvesters.openalex.add_affiliation_world_regions")
+    @patch("harvest.harvesters.openalex.add_source_world_region")
+    @patch("harvest.harvesters.openalex.fetch_data")
+    def test_harvest_applies_standardization_and_region_steps_in_order(
+        self,
+        mock_fetch_data,
+        mock_add_source_region,
+        mock_add_affiliation_regions,
+    ):
+        gzip_payload = _gzip_jsonl(
+            [
+                {
+                    "id": "https://openalex.org/W2",
+                    "publication_year": 2020,
+                }
+            ]
+        )
+        _mock_fetch_payloads(
+            mock_fetch_data,
+            {
+                "date": "2026-06-25",
+                "files": [
+                    {
+                        "url": self.part_s3,
+                        "meta": {"record_count": 1},
+                    }
+                ],
+            },
+            gzip_payload,
+        )
+
+        call_order = []
+        mock_add_source_region.side_effect = lambda source: call_order.append("source")
+        mock_add_affiliation_regions.side_effect = lambda source: call_order.append(
+            "affiliations"
+        )
+
+        harvest_openalex_works(
+            user=self.user,
+            from_updated_date="2026-03-01",
+            publication_year_from=2018,
+            is_xpac=False,
+        )
+
+        indexed_source = self.open_search.client.bulk.call_args.kwargs["body"][1]
+        self.assertEqual(
+            indexed_source["ids"]["openalex"],
+            "https://openalex.org/W2",
+        )
+        self.assertEqual(call_order, ["source", "affiliations"])
+
+    @patch("harvest.harvesters.openalex.fetch_data")
+    def test_harvest_marks_part_failed_when_bulk_indexing_fails(
+        self,
+        mock_fetch_data,
+    ):
+        gzip_payload = _gzip_jsonl(
+            [
+                {
+                    "id": "https://openalex.org/W2",
+                    "publication_year": 2020,
+                }
+            ]
+        )
+        _mock_fetch_payloads(mock_fetch_data, self.manifest, gzip_payload)
+        self.open_search.client.bulk.return_value = {
+            "errors": True,
+            "items": [
+                {
+                    "index": {
+                        "status": 500,
+                        "error": {"type": "index_error"},
+                    }
+                }
+            ],
+        }
+
+        harvest_openalex_works(
+            user=self.user,
+            from_updated_date="2026-03-01",
+            publication_year_from=2018,
+            is_xpac=False,
+        )
+
+        part = OpenAlexHarvestRequest.objects.get(request_kind="part")
+        manifest = OpenAlexHarvestRequest.objects.get(request_kind="manifest")
+        self.assertEqual(part.harvest_status, "failed")
+        self.assertEqual(part.index_status, "failed")
+        self.assertEqual(manifest.harvest_status, "failed")
+        self.assertEqual(part.document_ids, [])
+        self.assertIn(
+            "Falha ao indexar",
+            HarvestErrorLogOpenAlex.objects.get().exception_message,
+        )
+
+    @patch("harvest.harvesters.openalex.fetch_data")
+    def test_harvest_skips_invalid_work_and_continues(
+        self,
+        mock_fetch_data,
+    ):
+        gzip_payload = _gzip_jsonl(
+            [
+                {
+                    "publication_year": 2020,
+                },
+                {
+                    "id": "https://openalex.org/W2",
+                    "publication_year": 2020,
+                },
+            ]
+        )
+        _mock_fetch_payloads(
+            mock_fetch_data,
+            {
+                "date": "2026-06-25",
+                "files": [
+                    {
+                        "url": self.part_s3,
+                        "meta": {"record_count": 2},
+                    }
+                ],
+            },
+            gzip_payload,
+        )
+
+        harvest_openalex_works(
+            user=self.user,
+            from_updated_date="2026-03-01",
+            publication_year_from=2018,
+            is_xpac=False,
+        )
+
+        part = OpenAlexHarvestRequest.objects.get(request_kind="part")
+        self.assertEqual(part.harvest_status, "success")
+        self.assertEqual(part.index_status, "success")
+        self.assertEqual(part.result_count, 1)
+        self.assertEqual(
+            self.open_search.client.bulk.call_args.kwargs["body"][0]["index"]["_id"],
+            "https://openalex.org/W2",
+        )
 
     @override_settings(
         OPENALEX_WORKS_MANIFEST_URL=(
@@ -1578,6 +1841,7 @@ class HarvestOpenAlexSnapshotTests(TestCase):
         self.assertEqual(part_rows.count(), 1)
         failed = part_rows.get()
         self.assertEqual(failed.harvest_status, "failed")
+        self.assertEqual(failed.index_status, "pending")
         log = HarvestErrorLogOpenAlex.objects.get()
         self.assertIn("S3 timeout", log.exception_message)
         self.assertEqual(log.field_name, "part")
@@ -1608,15 +1872,13 @@ class HarvestOpenAlexSnapshotTests(TestCase):
             harvest_status="success",
             requested_at=timezone.now(),
         )
-
-        def fake_fetch(url, headers=None, json=False, timeout=2, verify=True):
-            if json:
-                return self.manifest
-            return _gzip_jsonl(
-                [{"id": "https://openalex.org/W3", "publication_year": 2020, "is_xpac": True}]
-            )
-
-        mock_fetch_data.side_effect = fake_fetch
+        _mock_fetch_payloads(
+            mock_fetch_data,
+            self.manifest,
+            _gzip_jsonl(
+                [{"id": "https://openalex.org/W3", "publication_year": 2020}]
+            ),
+        )
 
         harvest_openalex_works(
             user=self.user,
@@ -1644,6 +1906,145 @@ class HarvestOpenAlexSnapshotTests(TestCase):
             "success",
         )
 
+    @override_settings(
+        OPENALEX_WORKS_MANIFEST_URL=(
+            "https://openalex.s3.amazonaws.com/data/jsonl/works/manifest.json"
+        )
+    )
+    @patch("harvest.harvesters.openalex.fetch_data")
+    def test_harvest_reuses_failed_part_record(
+        self,
+        mock_fetch_data,
+    ):
+        existing = OpenAlexHarvestRequest.objects.create(
+            creator=self.user,
+            request_url=self.part_https,
+            request_kind="part",
+            updated_date=datetime(2026, 3, 1).date(),
+            publication_year_from=2018,
+            harvest_status="failed",
+            index_status="failed",
+            requested_at=timezone.now(),
+        )
+        _mock_fetch_payloads(
+            mock_fetch_data,
+            {
+                "date": "2026-06-25",
+                "files": [
+                    {
+                        "url": self.part_s3,
+                        "meta": {"record_count": 2},
+                    }
+                ]
+            },
+            _gzip_jsonl(
+                [
+                    {
+                        "id": "https://openalex.org/W2",
+                        "publication_year": 2020,
+                    }
+                ]
+            ),
+        )
+
+        harvest_openalex_works(
+            user=self.user,
+            from_updated_date="2026-03-01",
+            publication_year_from=2018,
+            is_xpac=False,
+        )
+
+        part_rows = OpenAlexHarvestRequest.objects.filter(request_kind="part")
+        self.assertEqual(part_rows.count(), 1)
+        reused = part_rows.get()
+        self.assertEqual(reused.pk, existing.pk)
+        self.assertEqual(reused.harvest_status, "success")
+        self.assertEqual(reused.index_status, "success")
+        self.assertEqual(reused.result_count, 1)
+        self.assertEqual(reused.document_ids, [])
+
+    @override_settings(
+        OPENALEX_WORKS_MANIFEST_URL=(
+            "https://openalex.s3.amazonaws.com/data/jsonl/works/manifest.json"
+        )
+    )
+    @patch("harvest.harvesters.openalex.fetch_data")
+    def test_harvest_reuses_incomplete_manifest(
+        self,
+        mock_fetch_data,
+    ):
+        existing = OpenAlexHarvestRequest.objects.create(
+            creator=self.user,
+            request_url=self.manifest_url,
+            request_kind="manifest",
+            updated_date=datetime(2026, 6, 25).date(),
+            publication_year_from=2018,
+            harvest_status="in_progress",
+            requested_at=timezone.now(),
+        )
+        _mock_fetch_payloads(
+            mock_fetch_data,
+            {
+                "date": "2026-06-25",
+                "files": [
+                    {
+                        "url": self.part_s3,
+                        "meta": {"record_count": 1},
+                    }
+                ]
+            },
+            _gzip_jsonl(
+                [{"id": "https://openalex.org/W2", "publication_year": 2020}]
+            ),
+        )
+
+        harvest_openalex_works(
+            user=self.user,
+            from_updated_date="2026-03-01",
+            publication_year_from=2018,
+        )
+
+        manifests = OpenAlexHarvestRequest.objects.filter(request_kind="manifest")
+        self.assertEqual(manifests.count(), 1)
+        reused = manifests.get()
+        self.assertEqual(reused.pk, existing.pk)
+        self.assertEqual(reused.harvest_status, "success")
+
+    @patch("harvest.harvesters.openalex.fetch_data")
+    def test_harvest_rollover_once_per_part_not_per_batch(
+        self,
+        mock_fetch_data,
+    ):
+        _mock_fetch_payloads(
+            mock_fetch_data,
+            {
+                "date": "2026-06-25",
+                "files": [
+                    {
+                        "url": self.part_s3,
+                        "meta": {"record_count": 2},
+                    }
+                ]
+            },
+            _gzip_jsonl(
+                [
+                    {"id": "https://openalex.org/W1", "publication_year": 2020},
+                    {"id": "https://openalex.org/W2", "publication_year": 2020},
+                ]
+            ),
+        )
+
+        harvest_openalex_works(
+            user=self.user,
+            from_updated_date="2026-03-01",
+            publication_year_from=2018,
+            batch_size=1,
+        )
+
+        self.assertEqual(self.open_search.client.bulk.call_count, 2)
+        self.open_search.rollover.assert_called_once()
+        self.open_search.ensure_rollover_index.assert_called_once()
+
     @patch("harvest.tasks.harvest_openalex_works")
     def test_task_delegates_manifest_scan_to_harvester(self, mock_harvest):
         from harvest.tasks import harvest_openalex_works_task
@@ -1652,7 +2053,7 @@ class HarvestOpenAlexSnapshotTests(TestCase):
             username=self.user.username,
             publication_year_from=2018,
             from_updated_date="2026-03-01",
-            is_xpac=True,
+            batch_size=50,
         )
 
         self.assertEqual(mock_harvest.call_args.kwargs["publication_year_from"], 2018)
@@ -1660,6 +2061,6 @@ class HarvestOpenAlexSnapshotTests(TestCase):
             mock_harvest.call_args.kwargs["from_updated_date"],
             "2026-03-01",
         )
-        self.assertEqual(mock_harvest.call_args.kwargs["is_xpac"], True)
+        self.assertEqual(mock_harvest.call_args.kwargs["is_xpac"], False)
+        self.assertEqual(mock_harvest.call_args.kwargs["batch_size"], 50)
         self.assertEqual(mock_harvest.call_args.kwargs["user"], self.user)
-
