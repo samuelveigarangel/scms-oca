@@ -4,8 +4,7 @@ Modelos para coleta e armazenamento de dados de múltiplos endpoints.
 from pathlib import Path
 
 from django.core.exceptions import ValidationError
-from django.db import models
-from django.db import transaction
+from django.db import models, transaction
 from django.utils import timezone
 from django.utils.translation import gettext_lazy as _
 from modelcluster.models import ClusterableModel
@@ -14,8 +13,8 @@ from wagtail.models import ParentalKey
 
 from core.forms import CoreAdminModelForm
 from core.models import CommonControlField
-from harvest.storage import global_metrics_upload_path, overwrite_media_storage
 from harvest.global_metrics.constants import SUPPORTED_EXTENSIONS
+from harvest.storage import global_metrics_upload_path, overwrite_media_storage
 
 
 class HarvestStatus(models.TextChoices):
@@ -605,6 +604,13 @@ class OpenAlexHarvestRequest(CommonControlField, ClusterableModel):
         default=HarvestStatus.PENDING,
         db_index=True,
     )
+    index_status = models.CharField(
+        _("Status da Indexação"),
+        max_length=20,
+        choices=IndexStatus.choices,
+        default=IndexStatus.PENDING,
+        db_index=True,
+    )
     requested_at = models.DateTimeField(
         _("Requisitado em"),
         blank=True,
@@ -622,6 +628,7 @@ class OpenAlexHarvestRequest(CommonControlField, ClusterableModel):
         FieldPanel("result_count"),
         FieldPanel("manifest_record_count"),
         FieldPanel("harvest_status"),
+        FieldPanel("index_status"),
         FieldPanel("requested_at"),
         InlinePanel("harvest_error_log"),
     ]
@@ -631,6 +638,7 @@ class OpenAlexHarvestRequest(CommonControlField, ClusterableModel):
         verbose_name_plural = _("Requisições OpenAlex")
         indexes = [
             models.Index(fields=["request_kind", "harvest_status"]),
+            models.Index(fields=["request_kind", "index_status"]),
         ]
 
     def __str__(self):
@@ -644,6 +652,18 @@ class OpenAlexHarvestRequest(CommonControlField, ClusterableModel):
         self.harvest_status = HarvestStatus.FAILED
         self.save(update_fields=["harvest_status", "updated"])
 
+    def mark_as_index_in_progress(self):
+        self.index_status = IndexStatus.IN_PROGRESS
+        self.save(update_fields=["index_status", "updated"])
+
+    def mark_as_indexed(self):
+        self.index_status = IndexStatus.SUCCESS
+        self.save(update_fields=["index_status", "updated"])
+
+    def mark_as_index_failed(self):
+        self.index_status = IndexStatus.FAILED
+        self.save(update_fields=["index_status", "updated"])
+
     @classmethod
     def get_completed_part_urls(cls):
         return set(
@@ -651,6 +671,30 @@ class OpenAlexHarvestRequest(CommonControlField, ClusterableModel):
                 request_kind=OpenAlexRequestKind.PART,
                 harvest_status=HarvestStatus.SUCCESS,
             ).values_list("request_url", flat=True)
+        )
+
+    @classmethod
+    def get_incomplete_part(cls, request_url):
+        return (
+            cls.objects.filter(
+                request_kind=OpenAlexRequestKind.PART,
+                request_url=request_url,
+            )
+            .exclude(harvest_status=HarvestStatus.SUCCESS)
+            .order_by("-updated", "-pk")
+            .first()
+        )
+
+    @classmethod
+    def get_incomplete_manifest(cls, updated_date):
+        return (
+            cls.objects.filter(
+                request_kind=OpenAlexRequestKind.MANIFEST,
+                updated_date=updated_date,
+            )
+            .exclude(harvest_status=HarvestStatus.SUCCESS)
+            .order_by("-updated", "-pk")
+            .first()
         )
 
 
